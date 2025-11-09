@@ -25,10 +25,10 @@ SMOOTH_FACTOR = 0.3
 MOUSE_HISTORY_SIZE = 10
 
 # ============ BLINK DETECTION (time-based) ============
-EAR_THRESHOLD = 0.22
-SHORT_MIN_FRAMES = 1        # minimal frames eyes must be closed to count
-LONG_BLINK_MIN_SEC = 0.35   # >= this => LONG blink
-BLINK_REFRACTORY_SEC = 0.25 # cooldown between blink actions
+EAR_THRESHOLD = 0.18
+SHORT_MIN_FRAMES =  2   # minimal frames eyes must be closed to count
+LONG_BLINK_MIN_SEC = 0.50# >= this => LONG blink
+BLINK_REFRACTORY_SEC = 1 # cooldown between blink actions
 
 # ============ IRIS DETECTION PARAMETERS ============
 IRIS_THRESHOLD = 60
@@ -500,18 +500,14 @@ class UltimateDlibEyeMouse:
                 u, v = float(uv[0]), float(uv[1])
 
             # ---------- SENSITIVITY SHAPING (NEW): gamma + gain ----------
-            # Map [0,1] -> [-1,1]
             ux = 2.0 * u - 1.0
             vy = 2.0 * v - 1.0
-            # Edge expansion/compression: |x|^gamma (gamma<1 expands edges)
             g = max(0.30, min(1.50, self.edge_gamma))
             ux = np.sign(ux) * (abs(ux) ** g)
             vy = np.sign(vy) * (abs(vy) ** g)
-            # Global sensitivity gain
             gain = max(0.5, min(2.5, self.sens_gain))
             ux *= gain
             vy *= gain
-            # Clamp and map back to [0,1]
             ux = max(-1.0, min(1.0, ux))
             vy = max(-1.0, min(1.0, vy))
             u = 0.5 * (ux + 1.0)
@@ -574,6 +570,55 @@ def main():
     print("  Closing (MAR < close_thr - hysteresis) only re-arms (no toggle)")
     print("=" * 70 + "\n")
     
+    def draw_info_panel(img, face_rect, avg_ear_value, mar_value):
+        # LEFT panel only. If face overlaps left band, skip drawing (you already have bottom HUD).
+        h, w = img.shape[:2]
+        panel_w = 260
+        if face_rect is not None and face_rect.left() < panel_w:
+            return  # don't draw anywhere if left panel would cover the face
+
+        x0 = 0  # left edge
+
+        # Semi-transparent background
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x0, 0), (x0 + panel_w, h), (0, 0, 0), -1)
+        img[:] = cv2.addWeighted(overlay, 0.35, img, 0.65, 0)
+
+        # Text helpers
+        x = x0 + 12
+        y = 24
+        dy = 20
+        def line(txt, col=(0,255,0)):
+            nonlocal y
+            cv2.putText(img, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 1, cv2.LINE_AA)
+            y += dy
+
+        # Top status
+        line(f"Mouse: {'ACTIVE' if eye_mouse.mouse_active else 'STOPPED'}",
+             (0,255,0) if eye_mouse.mouse_active else (0,0,255))
+        line(f"Calib: {'YES' if eye_mouse.is_calibrated else 'NO'} ({eye_mouse.calibration_count}/5)",
+             (255,255,255))
+        line(f"EAR: {avg_ear_value:.3f}  Thr:{eye_mouse.ear_threshold:.2f}", (255,255,255))
+        line(f"MAR: {mar_value:.3f}  Open:{eye_mouse.mouth_open_thr:.2f}", (255,255,0))
+        line(f"ReArm Thr:{eye_mouse.mouth_close_thr:.2f}  Hys:{eye_mouse.mouth_hyst:.2f}", (255,255,0))
+        line(f"Mouth Cooldown: {eye_mouse.mouth_toggle_cooldown:.2f}s", (200,200,200))
+        y += 6
+
+        # Tunables
+        line("— Parameters —", (180,255,180))
+        line(f"IrisThr: {eye_mouse.iris_threshold}", (255,255,255))
+        line(f"EdgeGamma: {eye_mouse.edge_gamma:.2f}", (255,255,255))
+        line(f"Gain: {eye_mouse.sens_gain:.2f}", (255,255,255))
+        line(f"SmoothN: {eye_mouse.history_size}", (255,255,255))
+        line(f"SNAP: {'ON' if eye_mouse.snap else 'OFF'}", (255,255,255))
+        y += 6
+
+        # Blink parameters
+        line("— Blink —", (180,255,180))
+        line(f"ShortMinFrames: {eye_mouse.short_min_frames}", (200,200,200))
+        line(f"LongBlink>= {eye_mouse.long_min_sec:.2f}s", (200,200,200))
+        line(f"Refractory: {eye_mouse.blink_refractory_sec:.2f}s", (200,200,200))
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -586,8 +631,13 @@ def main():
         faces = eye_mouse.detector(gray, 0)
         display_frame = frame.copy()
         
+        face_rect_for_panel = None
+        avg_ear = 0.3
+        mar = 0.0
+
         if faces:
             face = faces[0]
+            face_rect_for_panel = face
             landmarks = eye_mouse.predictor(gray, face)
             left_eye = [(landmarks.part(i).x, landmarks.part(i).y) for i in eye_mouse.LEFT_EYE_POINTS]
             right_eye = [(landmarks.part(i).x, landmarks.part(i).y) for i in eye_mouse.RIGHT_EYE_POINTS]
@@ -608,15 +658,22 @@ def main():
             mar = eye_mouse.mouth_inner_ratio(landmarks)
             eye_mouse.update_mouth_toggle(mar)
 
+            # Draw eye landmarks
             for pt in left_eye:
                 cv2.circle(display_frame, pt, 2, (0, 255, 0), -1)
             for pt in right_eye:
                 cv2.circle(display_frame, pt, 2, (0, 255, 0), -1)
+            # Draw detected iris centers
             if left_iris:
                 cv2.circle(display_frame, (int(left_iris[0]), int(left_iris[1])), 3, (255, 0, 0), -1)
             if right_iris:
                 cv2.circle(display_frame, (int(right_iris[0]), int(right_iris[1])), 3, (255, 0, 0), -1)
+
+            # Draw mouth INNER landmark points (60–67)
+            for i in eye_mouse.MOUTH_INNER_POINTS:
+                cv2.circle(display_frame, (landmarks.part(i).x, landmarks.part(i).y), 2, (0, 255, 255), -1)
             
+            # Small status near top (kept)
             blink_status_color = (0, 255, 0) if avg_ear > eye_mouse.ear_threshold else (0, 0, 255)
             blink_status_text = "Eyes Open ✓" if avg_ear > eye_mouse.ear_threshold else "Eyes Closed"
             cv2.putText(display_frame, blink_status_text, (20, 150),
@@ -640,6 +697,10 @@ def main():
             cv2.putText(display_frame, "No face detected - position your face in view", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
+        # LEFT info panel only (skips if it would cover face)
+        draw_info_panel(display_frame, face_rect_for_panel, avg_ear, mar)
+
+        # Existing top labels (kept)
         status_color = (0, 255, 0) if eye_mouse.mouse_active else (0, 0, 255)
         status_text = "ACTIVE ✅" if eye_mouse.mouse_active else "STOPPED ⏸"
         cv2.putText(display_frame, f"Mouse: {status_text}", (20, 30),
@@ -686,18 +747,14 @@ def main():
             eye_mouse.calibration_count = 0
             print("🔄 All calibration reset")
         elif key == ord('+') or key == ord('='):
-            # NOTE: '=' is also used for smoothing up; here '+' increases threshold
             if key == ord('+'):
                 eye_mouse.iris_threshold = min(100, eye_mouse.iris_threshold + 5)
                 print(f"👁️ Iris threshold: {eye_mouse.iris_threshold}")
-            else:
-                # '=' pressed for smoothing later
-                pass
         elif key == ord('-'):
             eye_mouse.iris_threshold = max(20, eye_mouse.iris_threshold - 5)
             print(f"👁️ Iris threshold: {eye_mouse.iris_threshold}")
 
-        # -------- LIVE SENSITIVITY HOTKEYS (NEW) --------
+        # LIVE sensitivity hotkeys
         if key == ord('['):
             eye_mouse.edge_gamma = max(0.40, eye_mouse.edge_gamma - 0.05)
             print(f"🧭 EDGE_GAMMA: {eye_mouse.edge_gamma:.2f} (lower = more sensitive edges)")
@@ -710,26 +767,17 @@ def main():
         elif key == ord('\''):
             eye_mouse.sens_gain = max(0.50, eye_mouse.sens_gain - 0.10)
             print(f"⚡ SENSITIVITY_GAIN: {eye_mouse.sens_gain:.2f}")
-        elif key == ord('-'):  # already used for iris down; add separate smoothing down?
-            pass
-        elif key == ord('='):
-            pass
-        # Use _ for smoothing down and + for smoothing up? Simpler: reuse -/= specifically for smoothing when SHIFT not pressed:
-        if key == ord('_'):  # optional; not all keyboards send this
-            pass
 
-        # Dedicated smoothing hotkeys (use , and . if you prefer)
-        if key == ord(','):  # less smoothing
+        if key == ord(','):
             eye_mouse.history_size = max(1, eye_mouse.history_size - 1)
             print(f"🪄 MOUSE_HISTORY_SIZE: {eye_mouse.history_size}")
-        elif key == ord('.'):  # more smoothing
+        elif key == ord('.'):
             eye_mouse.history_size = min(20, eye_mouse.history_size + 1)
             print(f"🪄 MOUSE_HISTORY_SIZE: {eye_mouse.history_size}")
 
         elif key == ord('0'):
             eye_mouse.snap = not eye_mouse.snap
             print(f"🚀 SNAP movement: {'ON' if eye_mouse.snap else 'OFF'}")
-        # -------------------------------------------------
 
     cap.release()
     cv2.destroyAllWindows()
